@@ -1,68 +1,75 @@
 import streamlit as st
+import httpx
 import pandas as pd
 import time
-from seleniumbase import SB
+import re
 
 st.set_page_config(page_title="SWS Strategy Engine", layout="wide")
 
-# --- ENGINE: FETCH DATA WITHOUT HEADERS ---
-def get_live_data(url):
-    """Uses SeleniumBase UC Mode to bypass Speedhive security automatically."""
+def get_live_data(token, session_id):
+    # This is the direct data endpoint the website uses internally
+    url = f"https://speedhive.mylaps.com/LiveTiming/GetData/{token}?sessionId={session_id}"
+    
+    # These headers are the "secret sauce" to bypass the char 0 block
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://speedhive.mylaps.com/livetiming/{token}-{session_id}/active",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
-        # 'uc=True' is the magic switch that makes the browser look human
-        with SB(uc=True, headless=True) as sb:
-            sb.open(url)
-            # We wait for the table to actually load its data
-            sb.wait_for_element("table", timeout=10)
+        # We use http2=True to match how modern browsers communicate
+        with httpx.Client(http2=True, headers=headers, timeout=10) as client:
+            response = client.get(url)
             
-            # Scrape the table data directly from the rendered page
-            table_data = sb.get_text_list("td")
-            headers = sb.get_text_list("th")
-            
-            # SeleniumBase can also pull the underlying API response 
-            # if the table scraping is too messy
-            return sb.get_beautiful_soup()
+            if response.status_code == 200:
+                # If the body is empty, we still get the char 0 error, so we check first
+                if not response.text.strip():
+                    return "Server sent an empty response (Bot block active)."
+                return response.json()
+            else:
+                return f"Server denied access (Error {response.status_code})."
     except Exception as e:
-        return f"Error: {e}"
+        return f"Connection Failed: {e}"
 
 # --- MAIN UI ---
-st.title("🏆 SWS Race Strategy Engine")
-st.write("This engine uses **Undetected Driver** mode to bypass Speedhive security.")
+st.title("🏆 Dubai SWS Kart Strategy Engine")
 
-url_input = st.sidebar.text_input("Paste Speedhive Session URL")
+# Input for the full URL
+url_input = st.sidebar.text_input(
+    "Paste Speedhive Session URL", 
+    value="https://speedhive.mylaps.com/livetiming/B3E58F71A3C54200-2147486187/active"
+)
 
-if url_input:
-    with st.spinner("Bypassing Speedhive security..."):
-        soup = get_live_data(url_input)
+# Extract Token and Session
+try:
+    token_match = re.search(r'livetiming/([A-Z0-9]+)-([0-9]+)', url_input)
+    token = token_match.group(1)
+    sess_id = token_match.group(2)
+    
+    if st.sidebar.button("Force Manual Refresh"):
+        st.rerun()
+
+    data = get_live_data(token, sess_id)
+
+    if isinstance(data, dict) and 'Rows' in data:
+        st.success(f"✅ Live Data Active for {token}")
+        df = pd.DataFrame(data['Rows'])
         
-        if hasattr(soup, 'find_all'): # If we got a valid BeautifulSoup object
-            rows = []
-            table = soup.find('table')
-            if table:
-                for tr in table.find_all('tr')[1:]:
-                    cols = [td.get_text(strip=True) for td in tr.find_all('td')]
-                    if len(cols) >= 5:
-                        rows.append({
-                            'Pos': cols[0],
-                            'Kart': cols[1],
-                            'Driver': cols[2],
-                            'Laps': cols[3],
-                            'Last Lap': cols[4]
-                        })
-                
-                if rows:
-                    st.success(f"Connected! Tracking {len(rows)} Drivers.")
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                else:
-                    st.warning("Connected, but the timing table is empty. Is the race running?")
-            else:
-                st.error("Could not find the timing table. Ensure the URL is correct.")
-        else:
-            st.error(f"Failed to bypass security: {soup}")
+        # Displaying the most critical race data
+        cols = ['Position', 'Number', 'DriverName', 'LastLapTime', 'BestLapTime', 'Laps']
+        available = [c for c in cols if c in df.columns]
+        st.dataframe(df[available].sort_values('Position'), use_container_width=True, hide_index=True)
+    else:
+        st.error(f"📡 Connection Issue: {data}")
+        st.info("Try refreshing the Speedhive page in your browser, then copy the URL again.")
 
-else:
-    st.info("Paste the Speedhive URL to begin tracking. No cookies required.")
+except Exception:
+    st.info("Please paste a valid Speedhive Live Timing URL in the sidebar.")
 
-if st.sidebar.toggle("Auto-Refresh (10s)", value=True):
-    time.sleep(10)
+# Auto-Refresh (Every 5 seconds for live racing)
+if st.sidebar.toggle("Auto-Refresh Feed", value=True):
+    time.sleep(5)
     st.rerun()
